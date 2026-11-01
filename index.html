@@ -1336,7 +1336,7 @@ const menu = (() => {
     pickHover() { this.pick(hover); },
   };
 })();
-function placeMenu() { if (!renderer.xr.isPresenting) { aimYaw = gunYaw; aimPitch = 0.04; } const f = aimFlatDir(); menu.mesh.position.copy(HEAD).addScaledVector(f, 2.6).add(V(0, 0.15, 0)); menu.mesh.lookAt(HEAD); }
+function placeMenu() { if (!renderer.xr.isPresenting) { aimYaw = gunYaw; aimPitch = 0.04; } const f = renderer.xr.isPresenting ? V(0, 0, -1).applyAxisAngle(UP, rigYaw) : aimFlatDir(); camera.getWorldPosition(camWorld); menu.mesh.position.copy(camWorld).addScaledVector(f, 2.6).add(V(0, 0.15, 0)); menu.mesh.lookAt(camWorld); }
 
 // aim reticle (where the guns actually point) + lead pip on the nearest enemy
 const ret = new THREE.Mesh(new THREE.RingGeometry(0.8, 1, 32), new THREE.MeshBasicMaterial({ color: 0xffc070, transparent: true, opacity: 0.55, depthTest: false, fog: false, side: THREE.DoubleSide }));
@@ -1449,7 +1449,9 @@ function updateGun(dt, aimDir) {
   }
   hud.hitMark.position.copy(rp); hud.hitMark.lookAt(camWorld); hud.hitMark.scale.setScalar(camWorld.distanceTo(rp) * 0.02);
 }
-let touchFire = false, holdFire = false, calib = 0;
+let touchFire = false, holdFire = false, calib = 0, rigYaw = 0, smoothTurn = false;
+const calOff = V();
+function applyRig() { rig.rotation.y = rigYaw; rig.position.copy(calOff).applyAxisAngle(UP, rigYaw); rig.updateMatrixWorld(true); }
 
 // ---------------------------------------------------------------------
 // Waves & game flow
@@ -1498,7 +1500,7 @@ function exitLock() { if (document.pointerLockElement) document.exitPointerLock?
 function showTitle() {
   state = 'title';
   menu.show('FLAK DEFENSE', 'Hold the gun pit. Shoot down fighters and bombers.\nBlue-marked planes are friendly: they drop supplies.', [
-    { name: 'Start', desc: 'VR: aim with a controller, trigger fires, A/X reloads.  Desktop: mouse aims, click fires, R reloads.' },
+    { name: 'Start', desc: 'Point & hold trigger to fire. Thumbstick turns you and the gun. A/X reload, B/Y recenter.' },
   ], () => startGame());
 }
 
@@ -1529,7 +1531,16 @@ function update(dt) {
     const s = ctrls[activeHand].held ? ctrls[activeHand] : (ctrls.find(c => c.held) || ctrls[activeHand]);
     if (s.held) activeHand = ctrls.indexOf(s);
     triggerHeld = ctrls.some(c => c.held); if (!triggerHeld) holdFire = false; if (holdFire) triggerHeld = false;
-    if (calib < 12) { calib++; rig.position.set(HEAD.x - camera.position.x, HEAD.y - camera.position.y, HEAD.z - camera.position.z); rig.updateMatrixWorld(true); }
+    if (calib < 12) { calib++; calOff.set(HEAD.x - camera.position.x, HEAD.y - camera.position.y, HEAD.z - camera.position.z); applyRig(); }
+    // thumbstick turning: the seat and gun swing round together (snap 30° by default, click stick for smooth)
+    for (const st of ctrls) {
+      const ax = st.gp?.axes || [], x = Math.abs(ax[2] || 0) > Math.abs(ax[0] || 0) ? (ax[2] || 0) : (ax[0] || 0);
+      const click = st.gp?.buttons?.[3]?.pressed;
+      if (click && !st.btnS) { smoothTurn = !smoothTurn; hud.flash(smoothTurn ? 'SMOOTH TURNING' : 'SNAP TURNING', '#d8c7a0'); }
+      st.btnS = !!click;
+      if (smoothTurn) { if (Math.abs(x) > 0.15) { rigYaw -= x * 1.4 * dt; applyRig(); } }
+      else { if (Math.abs(x) > 0.7 && st.stickReady !== false) { rigYaw -= Math.sign(x) * Math.PI / 6; st.stickReady = false; applyRig(); sfx('click', { vol: 0.4, rate: 0.7 }); } else if (Math.abs(x) < 0.3) st.stickReady = true; }
+    }
     const c = ctrls[activeHand].c; c.updateMatrixWorld();
     aimDir = V(0, 0, -1).applyQuaternion(c.getWorldQuaternion(tmpQ));
     // A/X reload
@@ -1579,7 +1590,7 @@ ui.innerHTML = `
 <div id="ov"><div class="box">
 <h1>FLAK DEFENSE</h1>
 <p>You man a twin anti-aircraft gun in a sandbagged pit. Enemy fighters strafe you and bombers drop bombs. Friendly planes (blue markers) drop health, ammo and upgrade crates. Don't shoot them!</p>
-<p><b>Quest:</b> point a controller and hold the trigger to fire. A/X reloads.<br><b>Desktop:</b> click to aim with the mouse, hold the button to fire, R to reload.</p>
+<p><b>Quest:</b> point a controller and hold the trigger to fire. Flick the thumbstick left/right to turn (click it for smooth turning). A/X reloads, B/Y recenters.<br><b>Desktop:</b> click to aim with the mouse, hold the button to fire, R to reload.</p>
 <button id="vrBtn" disabled>Checking VR…</button><button id="deskBtn">Play on this screen</button>
 <p><small id="vrNote"></small></p><p><small>No sound on iPhone? Turn off silent mode (the switch on the side) and turn the volume up.</small></p>
 </div></div>
@@ -1608,7 +1619,7 @@ vrBtn.onclick = async () => {
     try { if (session.supportedFrameRates?.includes(90)) session.updateTargetFrameRate(90); } catch (e) { }
     ov.style.display = 'none'; fireBtn.style.display = 'none';
     showTitle();
-    calib = 0; session.addEventListener('end', () => { ov.style.display = 'flex'; state = 'title'; menu.hide(); rig.position.copy(HEAD); camera.position.set(0, 0, 0); });
+    calib = 0; rigYaw = 0; session.addEventListener('end', () => { ov.style.display = 'flex'; state = 'title'; menu.hide(); rigYaw = 0; rig.rotation.y = 0; rig.position.copy(HEAD); camera.position.set(0, 0, 0); });
   } catch (e) { $('vrNote').textContent = 'Could not start VR: ' + e.message; }
 };
 
@@ -1635,7 +1646,7 @@ window.__game = {
   info() { renderer.render(scene, camera); return { calls: renderer.info.render.calls, tris: renderer.info.render.triangles, particles: live.length, planes: aircraft.length }; },
   snap() { renderer.render(scene, camera); return renderer.domElement.toDataURL('image/png'); },
   snapAt(px, py, pz, tx, ty, tz, fov) { const c = camera.clone(); scene.add(c); c.position.set(px, py, pz); c.fov = fov; c.lookAt(tx, ty, tz); c.updateProjectionMatrix(); c.updateMatrixWorld(); updateParticles(0, c); renderer.render(scene, c); scene.remove(c); return renderer.domElement.toDataURL('image/png'); },
-  dmgLog, initAudio, get SND() { return SND; }, camWorld, HEAD, PLAYER_POS, get gun() { return { gunYaw, gunPitch }; }, upgrades: UPGRADES, hurtSphere,
+  get rigYaw() { return rigYaw; }, dmgLog, initAudio, get SND() { return SND; }, camWorld, HEAD, PLAYER_POS, get gun() { return { gunYaw, gunPitch }; }, upgrades: UPGRADES, hurtSphere,
 };
 window.__ready = true;
 </script>
