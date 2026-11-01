@@ -16,6 +16,7 @@
 <script type="module">
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // =====================================================================
 // Utilities
@@ -860,7 +861,7 @@ function bindFire(root) {
 // ---------------------------------------------------------------------
 // Settings & upgrades
 // ---------------------------------------------------------------------
-const VERSION = '2.1';
+const VERSION = '2.2';
 const K_DRAG = 0.00035;   // shell air drag: dv/dt = -K v^2 (40 mm round loses ~45% speed over 2 s)
 const GUNS = {
   twin40: { name: 'Twin 40 mm', desc: 'Balanced all-rounder', mag: 32, reload: 2.6, rof: 7.0, dmg: 40, fuse: 5, muzzle: 880, heat: 0.03, kick: 0.16, cost: 0 },
@@ -1143,6 +1144,65 @@ function tankT() {
   bake(tur); g.traverse(o => { if (o.isMesh) o.castShadow = true; }); bake(g); return g;
 }
 const TEMPL = { enemy: fighter(false), friend: fighter(true), bomber: bomber(), stuka: diveBomberT(), zeppelin: airshipT(), troop: trooperT(), tank: tankT() };
+// ---- real 3D models (glTF): auto-orient any aircraft, swap it in for the procedural template once loaded ----
+function eig3(a) {   // Jacobi eigen-decomposition of a symmetric 3x3 matrix, sorted by eigenvalue (largest first)
+  const A = a.map(r => r.slice()), E = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (let sweep = 0; sweep < 40; sweep++) {
+    let p = 0, q = 1, mx = Math.abs(A[0][1]);
+    if (Math.abs(A[0][2]) > mx) { mx = Math.abs(A[0][2]); p = 0; q = 2; }
+    if (Math.abs(A[1][2]) > mx) { mx = Math.abs(A[1][2]); p = 1; q = 2; }
+    if (mx < 1e-9) break;
+    const th = 0.5 * Math.atan2(2 * A[p][q], A[q][q] - A[p][p]), c = Math.cos(th), s = Math.sin(th);
+    for (let k = 0; k < 3; k++) { const x = A[k][p], y = A[k][q]; A[k][p] = c * x - s * y; A[k][q] = s * x + c * y; }
+    for (let k = 0; k < 3; k++) { const x = A[p][k], y = A[q][k]; A[p][k] = c * x - s * y; A[q][k] = s * x + c * y; }
+    for (let k = 0; k < 3; k++) { const x = E[k][p], y = E[k][q]; E[k][p] = c * x - s * y; E[k][q] = s * x + c * y; }
+  }
+  return [0, 1, 2].map(i => ({ val: A[i][i], vec: V(E[0][i], E[1][i], E[2][i]).normalize() })).sort((x, y) => y.val - x.val);
+}
+function normalizeAircraft(src, span) {
+  // principal axes of the vertex cloud: largest spread = wingspan, next = fuselage, smallest = vertical
+  src.updateMatrixWorld(true);
+  const pts = [];
+  src.traverse(o => { if (o.isMesh) { const p = o.geometry.attributes.position, st = Math.max(1, Math.floor(p.count / 5000)); for (let i = 0; i < p.count; i += st) pts.push(V(p.getX(i), p.getY(i), p.getZ(i)).applyMatrix4(o.matrixWorld)); } });
+  const c = V(); pts.forEach(p => c.add(p)); c.divideScalar(pts.length);
+  const C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  pts.forEach(p => { const d = [p.x - c.x, p.y - c.y, p.z - c.z]; for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) C[i][j] += d[i] * d[j]; });
+  const proj = ax => pts.map(p => p.clone().sub(c).dot(ax));
+  const ext = ax => { const v = proj(ax); return Math.max(...v) - Math.min(...v); };
+  // pick axes by physical extent (wingspan is the longest dimension of WWII aircraft, height the shortest)
+  const E = eig3(C).map(e => ({ vec: e.vec, ext: ext(e.vec) })).sort((a, b) => b.ext - a.ext);
+  const spanAx = E[0].vec, lenAx = E[1].vec.clone(), upAx = E[2].vec.clone();
+  let sk = 0; proj(upAx).forEach(v => sk += v * v * v); if (sk < 0) upAx.negate();            // fin + canopy stick up further than the belly hangs down
+  const pu = proj(upAx), pl = proj(lenAx);
+  // the main wing sits nearer the nose than the tail on propeller aircraft: find the outer-wing points
+  const ps0 = proj(spanAx), smax = Math.max(...ps0.map(Math.abs)); let wsum = 0, wn = 0;
+  ps0.forEach((v, i) => { if (Math.abs(v) > smax * 0.55) { wsum += pl[i]; wn++; } });
+  const lmid = (Math.max(...pl) + Math.min(...pl)) / 2, nose = (wn ? wsum / wn : 0) > lmid ? lenAx.clone() : lenAx.clone().negate();
+  const right = V().crossVectors(nose, upAx).normalize(), up = V().crossVectors(right, nose).normalize();
+  const rot = new THREE.Matrix4().makeBasis(right, up, nose.clone().negate()).transpose();
+  const ps = proj(spanAx), k = span / (Math.max(...ps) - Math.min(...ps));
+  const offset = new THREE.Group(); offset.position.copy(c).negate(); offset.add(src);
+  const holder = new THREE.Group(); holder.quaternion.setFromRotationMatrix(rot); holder.scale.setScalar(k); holder.add(offset);
+  const out = new THREE.Group(); out.add(holder);
+  out.userData.noseZ = -Math.max(...proj(nose)) * k;
+  src.traverse(o => { if (o.isMesh) { o.castShadow = false; o.frustumCulled = true; if (o.material?.isMeshStandardMaterial) o.material.envMapIntensity = 0.9; } });
+  return out;
+}
+const MODEL_CREDITS = [];
+let modelsPending = 0;
+function loadAircraftModel(url, key, span, credit) {
+  modelsPending++;
+  new GLTFLoader().load(url, g => {
+    try {
+      const grp = normalizeAircraft(g.scene, span);
+      const disc = mk(new THREE.CircleGeometry(span * 0.13, 40), discMat, [0, 0, grp.userData.noseZ - 0.15], grp); disc.renderOrder = 5;
+      TEMPL[key] = grp; MODEL_CREDITS.push(credit); bindFire(grp);
+      const el = document.getElementById('credits'); if (el) el.textContent = 'Models: ' + MODEL_CREDITS.join(' · ');
+    } catch (e) { console.warn('model setup failed', url, e); }
+    modelsPending--;
+  }, undefined, e => { console.warn('model load failed (using built-in model)', url); modelsPending--; });
+}
+loadAircraftModel('models/spitfire.glb', 'friend', 11.2, '"Supermarine Spitfire" by Renafox (sketchfab.com/kryik1023), CC BY-NC 4.0');
 const markerMat = { enemy: new THREE.MeshBasicMaterial({ color: 0xff4a30, transparent: true, opacity: 0.85, depthTest: false, depthWrite: false, fog: false }), friend: new THREE.MeshBasicMaterial({ color: 0x5aa0ff, transparent: true, opacity: 0.9, depthTest: false, depthWrite: false, fog: false }), ground: new THREE.MeshBasicMaterial({ color: 0xffa040, transparent: true, opacity: 0.85, depthTest: false, depthWrite: false, fog: false }) };
 const markerGeo = (() => { const s = new THREE.Shape(); s.moveTo(-0.5, 0.6); s.lineTo(0.5, 0.6); s.lineTo(0, -0.2); s.lineTo(-0.5, 0.6); const h = new THREE.Path(); h.moveTo(-0.3, 0.48); h.lineTo(0, 0.05); h.lineTo(0.3, 0.48); h.lineTo(-0.3, 0.48); s.holes.push(h); return new THREE.ShapeGeometry(s); })();
 function mkMarker(mat) { const m = new THREE.Mesh(markerGeo, mat); m.renderOrder = 900; scene.add(m); return m; }
@@ -2168,7 +2228,7 @@ ui.innerHTML = `
 <p>You man a twin anti-aircraft gun in a sandbagged pit. Enemy fighters strafe you and bombers drop bombs. Friendly planes (blue markers) drop health, ammo and upgrade crates. Don't shoot them!</p>
 <p><b>Quest:</b> point a controller and hold the trigger to fire. Flick the thumbstick left/right to turn (click it for smooth turning). A/X reloads, or grab the glowing clip with the grip button and push it into the loader. B/Y recenters.<br><b>Desktop:</b> click to aim with the mouse, hold the button to fire, R to reload.</p>
 <button id="vrBtn" disabled>Checking VR…</button><button id="deskBtn">Play on this screen</button>
-<p><small id="vrNote"></small></p><p><small>No sound on iPhone? Turn off silent mode (the switch on the side) and turn the volume up.</small></p>
+<p><small id="vrNote"></small></p><p><small id="credits" style="color:#8a7a60"></small></p><p><small>No sound on iPhone? Turn off silent mode (the switch on the side) and turn the volume up.</small></p>
 </div></div>
 <button id="fireBtn">FIRE</button><button id="sndBtn">🔈 Tap for sound</button>`;
 document.body.appendChild(ui);
@@ -2223,7 +2283,7 @@ window.__game = {
   info() { renderer.render(scene, camera); return { calls: renderer.info.render.calls, tris: renderer.info.render.triangles, particles: live.length, planes: aircraft.length }; },
   snap() { renderer.render(scene, camera); return renderer.domElement.toDataURL('image/png'); },
   snapAt(px, py, pz, tx, ty, tz, fov) { const c = camera.clone(); scene.add(c); c.position.set(px, py, pz); c.fov = fov; c.lookAt(tx, ty, tz); c.updateProjectionMatrix(); c.updateMatrixWorld(); updateParticles(0, c); renderer.render(scene, c); scene.remove(c); return renderer.domElement.toDataURL('image/png'); },
-  get scene() { return scene; }, spawn(t) { return t === 'tank' ? spawnTank() : spawnPlane(t); }, trooper(x, y, z) { return new Trooper(V(x, y, z), V()); }, place(o, x, y, z, tx, ty, tz) { o.pos.set(x, y, z); o.fwd = V(tx, ty, tz).sub(o.pos).normalize(); }, get rigYaw() { return rigYaw; }, units, setTOD, get tod() { return tod; }, equipGun, openShop, achieved, GUNS, dmgLog, initAudio, get SND() { return SND; }, camWorld, HEAD, PLAYER_POS, get gun() { return { gunYaw, gunPitch }; }, upgrades: UPGRADES, hurtSphere,
+  get scene() { return scene; }, get modelsPending() { return modelsPending; }, TEMPL, spawn(t) { return t === 'tank' ? spawnTank() : spawnPlane(t); }, trooper(x, y, z) { return new Trooper(V(x, y, z), V()); }, place(o, x, y, z, tx, ty, tz) { o.pos.set(x, y, z); o.fwd = V(tx, ty, tz).sub(o.pos).normalize(); }, get rigYaw() { return rigYaw; }, units, setTOD, get tod() { return tod; }, equipGun, openShop, achieved, GUNS, dmgLog, initAudio, get SND() { return SND; }, camWorld, HEAD, PLAYER_POS, get gun() { return { gunYaw, gunPitch }; }, upgrades: UPGRADES, hurtSphere,
 };
 window.__ready = true;
 </script>

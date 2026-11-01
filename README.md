@@ -10,3 +10,7 @@ A WebXR anti-aircraft battlefield game for Meta Quest (also playable on desktop 
 Shoot down fighters, bombers, dive bombers, low-level attackers, paratroopers, tanks and an airship boss every 5 waves, across dusk, night, storm and dawn battles. Spend points in the supply depot between waves on upgrades and three guns (quad 20 mm, twin 40 mm, 88 mm flak). Friendly planes (blue markers) drop health, ammo and upgrade crates. Don't shoot them.
 
 Everything (models, textures, sound) is generated in code; the only dependency is three.js from a CDN.
+
+## Credits
+
+- Friendly fighter: "Supermarine Spitfire" (https://sketchfab.com/3d-models/supermarine-spitfire-8349f26e1e88455da75dd7352b02b794) by Renafox (https://sketchfab.com/kryik1023), licensed under CC BY-NC 4.0 (http://creativecommons.org/licenses/by-nc/4.0/). Textures resized/converted to WebP for the Quest. Non-commercial use only.
