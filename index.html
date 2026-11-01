@@ -860,7 +860,8 @@ function bindFire(root) {
 // ---------------------------------------------------------------------
 // Settings & upgrades
 // ---------------------------------------------------------------------
-const VERSION = '2.0';
+const VERSION = '2.1';
+const K_DRAG = 0.00035;   // shell air drag: dv/dt = -K v^2 (40 mm round loses ~45% speed over 2 s)
 const GUNS = {
   twin40: { name: 'Twin 40 mm', desc: 'Balanced all-rounder', mag: 32, reload: 2.6, rof: 7.0, dmg: 40, fuse: 5, muzzle: 880, heat: 0.03, kick: 0.16, cost: 0 },
   quad20: { name: 'Quad 20 mm', desc: 'A hose of fast, light shells', mag: 80, reload: 3.0, rof: 16, dmg: 15, fuse: 3, muzzle: 900, heat: 0.0115, kick: 0.07, cost: 1500 },
@@ -1019,7 +1020,30 @@ function fxMuzzle(p, dir, s = 1) {
   for (let k = 0; k < 4; k++) { const sd = V(rand(-1, 1), rand(-1, 1), rand(-1, 1)).cross(dir).normalize(); emit({ kind: 'streak', cell: 3, add: 1, pos: p.clone().addScaledVector(dir, 0.3 * s).addScaledVector(sd, 0.25 * s), dir: sd, size: 0.55 * s, width: 0.08 * s, col: [1, 0.8, 0.5], life: 0.05 }); }
   emit({ kind: 'smoke', cell: 0, pos: p.clone().addScaledVector(dir, 0.9 * s), vel: dir.clone().multiplyScalar(3).add(V(0, 0.5, 0)), size: 0.6 * s, grow: 4, life: 1.8, alpha: 0.35 });
 }
+const debris = [];
+const debrisGeo = { wing: new THREE.BoxGeometry(4.2, 0.14, 1.7), panel: new THREE.BoxGeometry(0.9, 0.05, 0.6), chunk: new THREE.BoxGeometry(0.6, 0.4, 0.8) };
+function shedDebris(pl, sc = 1) {
+  const S = SKINS[pl.friendly ? 'friend' : 'enemy'];
+  for (const [g, mat, n] of [['wing', S.wing, 1], ['panel', S.body, 5], ['chunk', frameMat, 2]]) for (let i = 0; i < n; i++) {
+    if (debris.length > 80) return;
+    const m = new THREE.Mesh(debrisGeo[g], mat); m.scale.setScalar(sc); m.quaternion.copy(pl.mesh.quaternion); scene.add(m);
+    const d = { m, kind: g, alive: true, pos: pl.pos.clone().add(V(rand(-2, 2), rand(-1, 1), rand(-2, 2))), axis: V(rand(-1, 1), rand(-1, 1), rand(-1, 1)).normalize(), spin: rand(2, 7) * (g === 'wing' ? 0.6 : 1),
+      vel: pl.fwd.clone().multiplyScalar(pl.speed * 0.6).add(V(rand(-1, 1), rand(-0.3, 1), rand(-1, 1)).multiplyScalar(g === 'wing' ? 8 : 18)) };
+    if (g === 'wing') dynEmitter(() => emit({ kind: 'black', cell: 0, pos: d.pos.clone(), size: rand(1, 1.6) * sc, grow: 3, life: rand(4, 7), dark: 0.08, alpha: 0.7 }), 14, 40, () => d.alive);
+    debris.push(d);
+  }
+}
+function updateDebris(dt) {
+  for (let i = debris.length - 1; i >= 0; i--) {
+    const d = debris[i]; d.vel.y -= G * dt; d.vel.multiplyScalar(1 - dt * (d.kind === 'wing' ? 0.25 : 0.6)); d.pos.addScaledVector(d.vel, dt);
+    d.m.position.copy(d.pos); d.m.rotateOnAxis(d.axis, d.spin * dt);
+    if (d.pos.y <= heightAt(d.pos.x, d.pos.z) + 0.2) { fxDust(d.pos, d.kind === 'wing' ? 1.6 : 0.6); if (d.kind === 'wing' && d.pos.distanceTo(HEAD) < 200) sfx('clang', { pos: d.pos, vol: 0.7, rate: 0.5 }); d.alive = false; scene.remove(d.m); debris.splice(i, 1); }
+  }
+}
 function fxFlak(p, s = 1) {
+  // pilots near a burst break hard; shrapnel rains down
+  for (const a of aircraft) if (!a.dying && !a.friendly && !(a.evadeT > 0) && a.pos.distanceTo(p) < 55) { a.evadeT = rand(1.2, 2.2); a.evadeDir = V(rand(-1, 1), rand(-0.6, 0.8), rand(-1, 1)).normalize(); }
+  for (let i = 0; i < 5; i++) emit({ kind: 'clod', cell: 0, pos: p.clone(), vel: V(rand(-1, 1), rand(-1, 0.5), rand(-1, 1)).multiplyScalar(rand(6, 14)), size: 0.14 * s, life: 4 });
   emit({ kind: 'glow', cell: 2, add: 1, pos: p.clone(), size: 7 * s, life: 0.14 });
   emit({ kind: 'fire', cell: 1, add: 1, pos: p.clone(), size: 3.5 * s, life: 0.25 });
   for (let i = 0; i < 5; i++) emit({ kind: 'black', cell: 0, pos: p.clone().add(V(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(1.2 * s)), vel: V(rand(-1, 1), rand(-0.5, 1), rand(-1, 1)).multiplyScalar(2), size: rand(2.4, 3.6) * s, grow: 1.4, life: rand(6, 10), dark: 0.15, alpha: 0.85 });
@@ -1157,9 +1181,10 @@ class Plane {
   }
   steer(desired, dt) {
     desired.normalize();
+    if (this.evadeT > 0 && !this.dying) { this.evadeT -= dt; const k = this.type === 'bomber' || this.type === 'transport' ? 0.3 : this.type === 'zeppelin' ? 0 : 1.1; desired.addScaledVector(this.evadeDir, k).normalize(); }
     if (this.pos.y < 35 && !this.dying && this.state !== 'dive') desired.y = Math.max(desired.y, 0.45 * (1 - this.pos.y / 35) + 0.05);
     desired.normalize();
-    const ang = this.fwd.angleTo(desired), maxA = this.turn * dt;
+    const ang = this.fwd.angleTo(desired), maxA = this.turn * dt * (this.evadeT > 0 ? 1.6 : 1);
     const side = tv1.crossVectors(this.fwd, desired).y;
     if (ang > 1e-4) { const k = Math.min(1, maxA / ang); this.fwd.lerp(desired, k).normalize(); }
     const big = this.type === 'bomber' || this.type === 'transport' ? 0.4 : this.type === 'zeppelin' ? 0.05 : 1;
@@ -1185,6 +1210,7 @@ class Plane {
     if (this.stukaSnd) { try { this.stukaSnd.stop(); } catch (e) { } }
     const big = this.type === 'bomber' || this.type === 'transport' ? 1.4 : this.type === 'zeppelin' ? 2.5 : 1;
     fxAirExplosion(this.pos, big); sfx('boom', { pos: this.pos, vol: 1.6, ref: 120, rate: rand(0.9, 1.1) });
+    if (this.type !== 'zeppelin') shedDebris(this, big);
     dynEmitter(() => emit({ kind: 'fire', cell: 1, add: 1, pos: this.pos.clone().addScaledVector(this.fwd, this.half ? rand(-40, 40) : 0).add(V(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(big)), vel: this.fwd.clone().multiplyScalar(-20), size: rand(2, 3.5) * big, life: rand(0.3, 0.6) }), 40, 999, () => this.alive);
     dynEmitter(() => emit({ kind: 'black', cell: 0, pos: this.pos.clone().addScaledVector(this.fwd, this.half ? rand(-40, 40) : 0), size: rand(2, 3) * big, grow: 3, life: rand(8, 12), dark: 0.06, lit: 0.6, alpha: 0.9 }), 22, 999, () => this.alive);
     if (this.type === 'zeppelin') dynEmitter(() => { const p = this.pos.clone().addScaledVector(this.fwd, rand(-45, 45)); fxAirExplosion(p, 1.2); sfx('boom', { pos: p, vol: 1.4, ref: 150, rate: rand(0.6, 0.9) }); }, 0.8, 999, () => this.alive);
@@ -1225,6 +1251,11 @@ class Plane {
   }
   fighterAI(dt, toP, dist) {
     this.timer -= dt;
+    if (this.state === 'formation') {
+      const L = this.leader;
+      if (!L || !L.alive || L.dying || dist < 700 || L.state !== 'attack') { this.state = 'attack'; this.speed = this.speed0 || this.speed; }
+      else { const to = this.slot.clone().applyQuaternion(L.mesh.quaternion).add(L.pos).addScaledVector(L.fwd, 25).sub(this.pos); this.speed = clamp(L.speed + to.dot(L.fwd) * 0.6 + 4, L.speed - 20, L.speed + 25); this.steer(to, dt); return; }
+    }
     if (this.state === 'attack') {
       const side = V(-toP.z, 0, toP.x).normalize(), jink = dist > 280 ? Math.sin(clock.t * 1.4 + this.weave) * clamp(dist * 0.12, 0, 90) * (1 + Math.min(P.wave, 8) * 0.06) : 0;
       const aimPt = tv2.copy(PLAYER_POS).add(V(0, clamp((dist - 120) * 0.22, 0, 160), 0)).addScaledVector(side, jink);
@@ -1481,7 +1512,7 @@ function updateProjectiles(dt) {
   // our shells: proximity fuse against planes (capsule test for the airship), paratroopers and tanks
   for (let i = shells.length - 1; i >= 0; i--) {
     const s = shells[i], prev = s.pos.clone();
-    s.vel.y -= G * dt; s.pos.addScaledVector(s.vel, dt); s.t += dt;
+    const sp = s.vel.length(); s.vel.multiplyScalar(1 / (1 + K_DRAG * sp * dt)); s.vel.y -= G * dt; s.pos.addScaledVector(s.vel, dt); s.t += dt;
     s.p.pos.copy(s.pos).addScaledVector(s.p.dir.copy(s.vel).normalize(), -3);
     let boom = null, target = null, direct = false, bd = 1e9, core = 0;
     for (const a of aircraft) {
@@ -1853,8 +1884,9 @@ function updateGun(dt, aimDir) {
   for (const a of aircraft) { if (a.friendly || a.dying) continue; const ang = bd.angleTo(tv1.copy(a.pos).sub(camWorld)); if (ang < bestA) { bestA = ang; best = a; } }
   lead.visible = !!best && ret.visible;
   if (best) {
-    let t = best.pos.distanceTo(camWorld) / P.muzzle; const lp = V();
-    for (let k = 0; k < 3; k++) { lp.copy(best.pos).addScaledVector(best.fwd, best.speed * t).add(V(0, 0.5 * G * t * t, 0)); t = lp.distanceTo(camWorld) / P.muzzle; }
+    // time of flight with quadratic drag: t = (e^(K d) - 1) / (K v0); shells also drop under gravity
+    const lp = best.pos.clone(); let t = 0;
+    for (let k = 0; k < 4; k++) { const d = lp.distanceTo(camWorld); t = (Math.exp(K_DRAG * d) - 1) / (K_DRAG * P.muzzle); lp.copy(best.pos).addScaledVector(best.fwd, best.speed * t).add(V(0, 0.55 * G * t * t, 0)); }
     lead.position.copy(lp); lead.lookAt(camWorld); lead.scale.setScalar(lp.distanceTo(camWorld) * 0.01);
   }
   hud.hitMark.position.copy(rp); hud.hitMark.lookAt(camWorld); hud.hitMark.scale.setScalar(camWorld.distanceTo(rp) * 0.02);
@@ -1911,7 +1943,18 @@ function updateWave(dt) {
   if (state !== 'wave') return;
   waveState.spawnT -= dt;
   const alive = aircraft.filter(a => !a.friendly && !a.dying && a.type !== 'zeppelin').length;
-  if (waveState.queue.length && waveState.spawnT <= 0 && alive < maxAlive()) { spawnPlane(waveState.queue.shift()); waveState.spawnT = rand(3, 7) / Math.sqrt(P.wave); }
+  if (waveState.queue.length && waveState.spawnT <= 0 && alive < maxAlive()) {
+    const t = waveState.queue.shift(), lead = spawnPlane(t);
+    if (t === 'enemy' && P.wave >= 2) {   // fighters arrive in pairs (threes from wave 5), wingmen hold a slot behind the leader
+      const want = P.wave >= 5 ? 2 : 1;
+      for (let n = 0; n < want && waveState.queue[0] === 'enemy'; n++) {
+        waveState.queue.shift();
+        const slot = V(n ? 30 : -30, -5 + n * 3, 32 + n * 12), w = new Plane('enemy', slot.clone().applyQuaternion(lead.mesh.quaternion).add(lead.pos), lead.fwd.clone());
+        w.state = 'formation'; w.leader = lead; w.slot = slot; w.speed0 = w.speed;
+      }
+    }
+    waveState.spawnT = rand(3, 7) / Math.sqrt(P.wave);
+  }
   if (waveState.tanks > 0) { waveState.tankT -= dt; if (waveState.tankT <= 0) { waveState.tanks--; spawnTank(); waveState.tankT = rand(10, 20); } }
   if (waveState.boss) { waveState.bossT -= dt; if (waveState.bossT <= 0) { waveState.boss = false; spawnPlane('zeppelin'); sfx('siren', { vol: 0.7, rate: 0.8 }); } }
   waveState.friendT -= dt;
@@ -2092,7 +2135,7 @@ function update(dt) {
   for (let i = pendingSnd.length - 1; i >= 0; i--) { const e = pendingSnd[i]; if (clock.t >= e.at) { pendingSnd.splice(i, 1); if (e.fn) e.fn(); else sfx(e.name, e.opts); } }
   for (const a of [...aircraft]) a.update(dt);
   for (const u of [...units]) u.update(dt);
-  updateProjectiles(dt);
+  updateProjectiles(dt); updateDebris(dt);
   updateAtmosphere(dt);
   runDynEmitters(dt); runEmitters(dt); ambient(dt);
   updateParticles(dt, camera);
