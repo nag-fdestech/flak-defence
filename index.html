@@ -905,10 +905,36 @@ function initAudio() {
       const b = ctx.createBuffer(1, n - fade, sr); b.getChannelData(0).set(raw.subarray(0, n - fade)); B.wind = b;
     }
     SND.ok = true;
+    ctx.onstatechange = () => updateSoundBtn();
     const amb = new THREE.Audio(SND.listener); amb.setBuffer(B.wind); amb.setLoop(true); amb.setVolume(0.35); amb.play(); SND.amb = amb;
     ctx.resume?.();
   } catch (e) { console.warn('audio init failed', e); }
 }
+let unlockEl = null, muted = false;
+function silentWavUrl() {
+  const sr = 8000, n = sr / 2, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf); let o = 0;
+  const str = s => { for (const ch of s) v.setUint8(o++, ch.charCodeAt(0)); }, u32 = x => { v.setUint32(o, x, true); o += 4; }, u16 = x => { v.setUint16(o, x, true); o += 2; };
+  str('RIFF'); u32(36 + n * 2); str('WAVE'); str('fmt '); u32(16); u16(1); u16(1); u32(sr); u32(sr * 2); u16(2); u16(16); str('data'); u32(n * 2);
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+function unlockAudio() {
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { }   // iOS 16.4+: play even with the silent switch on
+  try { if (!unlockEl) { unlockEl = new Audio(silentWavUrl()); unlockEl.loop = true; unlockEl.setAttribute('playsinline', ''); } unlockEl.play().catch(() => { }); } catch (e) { }
+  initAudio();
+  const ctx = SND.listener?.context;
+  if (ctx) {
+    if (ctx.state !== 'running') ctx.resume().catch(() => { });
+    try { const b = ctx.createBuffer(1, 1, 22050), src = ctx.createBufferSource(); src.buffer = b; src.connect(ctx.destination); src.start(0); } catch (e) { }
+  }
+  updateSoundBtn();
+}
+function updateSoundBtn() {
+  const b = document.getElementById('sndBtn'); if (!b) return;
+  const st = SND.listener?.context?.state;
+  b.textContent = muted ? '🔇 Sound off' : st === 'running' ? '🔊 Sound on' : '🔈 Tap for sound';
+}
+['pointerdown', 'touchend', 'click', 'keydown'].forEach(ev => document.addEventListener(ev, () => { if (!SND.ok || SND.listener.context.state !== 'running') unlockAudio(); }, { capture: true, passive: true }));
+document.addEventListener('visibilitychange', () => { if (!document.hidden && SND.ok) SND.listener.context.resume().catch(() => { }); });
 function sfx(name, { pos = null, vol = 1, rate = 1, ref = 15, roll = 1.2 } = {}) {
   if (!SND.ok || !SND.buf[name] || SND.active > 28) return null;
   const a = pos ? new THREE.PositionalAudio(SND.listener) : new THREE.Audio(SND.listener);
@@ -1338,7 +1364,7 @@ const ctrls = [0, 1].map(i => {
   const st = { c, grip, laser, held: false, gp: null, btnA: false };
   c.addEventListener('connected', e => { st.gp = e.data.gamepad; st.hand = e.data.handedness; });
   c.addEventListener('disconnected', () => { st.gp = null; });
-  c.addEventListener('selectstart', () => { st.held = true; activeHand = i; initAudio(); if (menu.open) { menu.pickHover(); holdFire = true; } });
+  c.addEventListener('selectstart', () => { st.held = true; activeHand = i; unlockAudio(); if (menu.open) { menu.pickHover(); holdFire = true; } });
   c.addEventListener('selectend', () => { st.held = false; });
   return st;
 });
@@ -1547,6 +1573,7 @@ ui.innerHTML = `
 #ov button:disabled{opacity:.4;cursor:default}
 #ov small{color:#8a7a60}
 #fireBtn{position:fixed;right:22px;bottom:22px;width:110px;height:110px;border-radius:50%;background:rgba(200,60,30,.55);border:3px solid rgba(255,200,150,.7);color:#fff;font:bold 20px system-ui;display:none;z-index:5;user-select:none;-webkit-user-select:none;touch-action:none}
+#sndBtn{position:fixed;left:14px;top:14px;z-index:15;padding:8px 14px;border-radius:20px;border:1px solid rgba(255,220,160,.5);background:rgba(20,15,10,.6);color:#ffe2a0;font:15px system-ui}
 #load{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#120d09;color:#c8b898;font:18px system-ui;z-index:20}
 </style>
 <div id="ov"><div class="box">
@@ -1554,15 +1581,16 @@ ui.innerHTML = `
 <p>You man a twin anti-aircraft gun in a sandbagged pit. Enemy fighters strafe you and bombers drop bombs. Friendly planes (blue markers) drop health, ammo and upgrade crates. Don't shoot them!</p>
 <p><b>Quest:</b> point a controller and hold the trigger to fire. A/X reloads.<br><b>Desktop:</b> click to aim with the mouse, hold the button to fire, R to reload.</p>
 <button id="vrBtn" disabled>Checking VR…</button><button id="deskBtn">Play on this screen</button>
-<p><small id="vrNote"></small></p>
+<p><small id="vrNote"></small></p><p><small>No sound on iPhone? Turn off silent mode (the switch on the side) and turn the volume up.</small></p>
 </div></div>
-<button id="fireBtn">FIRE</button>`;
+<button id="fireBtn">FIRE</button><button id="sndBtn">🔈 Tap for sound</button>`;
 document.body.appendChild(ui);
 const $ = id => document.getElementById(id);
+$('sndBtn').addEventListener('click', e => { e.stopPropagation(); if (!SND.ok || SND.listener.context.state !== 'running') { muted = false; unlockAudio(); } else { muted = !muted; SND.listener.setMasterVolume(muted ? 0 : 1); } updateSoundBtn(); sfx('click', { vol: 1 }); });
 const vrBtn = $('vrBtn'), deskBtn = $('deskBtn'), ov = $('ov'), fireBtn = $('fireBtn');
-fireBtn.addEventListener('touchstart', e => { e.preventDefault(); touchFire = true; initAudio(); }); fireBtn.addEventListener('touchend', () => touchFire = false);
+fireBtn.addEventListener('touchstart', e => { e.preventDefault(); touchFire = true; }); fireBtn.addEventListener('touchend', () => { touchFire = false; unlockAudio(); }); fireBtn.addEventListener('touchend', () => touchFire = false);
 if ('ontouchstart' in window) fireBtn.style.display = 'block';
-deskBtn.onclick = () => { initAudio(); ov.style.display = 'none'; startGame(); cvs.requestPointerLock?.(); };
+deskBtn.onclick = () => { unlockAudio(); ov.style.display = 'none'; startGame(); cvs.requestPointerLock?.(); };
 async function checkVR() {
   let ok = false;
   try { ok = !!navigator.xr && await navigator.xr.isSessionSupported('immersive-vr'); } catch (e) { ok = false; }
@@ -1571,7 +1599,7 @@ async function checkVR() {
 }
 checkVR();
 vrBtn.onclick = async () => {
-  initAudio();
+  unlockAudio();
   try {
     const session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] });
     renderer.xr.setFramebufferScaleFactor(1.0);
